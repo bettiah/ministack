@@ -4426,20 +4426,19 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
     return None
 
 def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, size: int, sigv4: bool):
-    """Verify a signed form and its expanded fields before any object mutation.
-
-    POST signs the Base64 policy itself, rather than a canonical HTTP request:
-    SigV4 with the scoped signing key, legacy SigV2 with HMAC-SHA1 of the secret.
-    Anonymous forms retain their existing handling.
-    """
+    """Check a signed form's policy before any write; the signature and signer only under AUTH=true."""
+    from ministack.app import AUTH
     def invalid():
         logger.debug("S3 POST rejected: invalid policy document")
         return _error("InvalidPolicyDocument", "The content of the form does not meet the conditions "
                       "specified in the policy document.", 400)
 
-    def denied(reason="policy condition not satisfied"):
+    def denied(reason):
         logger.debug("S3 POST rejected: %s", reason)
-        return _error("AccessDenied", "Access Denied", 403)
+        return _error("AccessDenied", f"Invalid according to Policy: {reason}", 403)
+
+    def condition_failed(operator, name, value):
+        return denied(f"Policy Condition failed: {json.dumps([operator, name, value])}")
 
     def invalid_argument(reason):
         logger.debug("S3 POST rejected: %s", reason)
@@ -4466,35 +4465,35 @@ def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, siz
     else:
         access_key, signed_region = fields["awsaccesskeyid"], region
 
-    # Use the signer's tenant only for credential and IAM resolution. The
-    # bucket-owner scope chosen by _apply_bucket_scope must survive the upload.
-    try:
-        account = find_iam_access_key_account(access_key) or access_key
-    except AmbiguousAccessKeyError:
-        return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
-    with request_scope(get_account_id(), region):
-        set_request_account_id(account)
-        credential = resolve_credential(access_key, get_account_id(), fields.get("x-amz-security-token", ""))
-    if isinstance(credential, CredentialResolutionError):
-        if credential.code == "ExpiredTokenException":
-            return _error("ExpiredToken", "The provided token has expired.", 400)
-        if credential.code == "InvalidToken":
-            return _error("InvalidToken", credential.message, 400)
-        return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
-    # The signature covers the Base64 policy as sent, so it is checked before decoding.
     encoded = fields["policy"]
-    if sigv4:
-        computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
-        signature = fields["x-amz-signature"]
-        signed = re.fullmatch(r"[0-9a-f]{64}", signature) and signatures_match(computed, signature)
-    else:
-        digest = hmac.new(credential.secret_access_key.encode(), encoded.encode(), hashlib.sha1).digest()
-        signature = fields["signature"]
-        signed = signature.isascii() and signatures_match(base64.b64encode(digest).decode(), signature)
-    if not signed:
-        logger.debug("S3 POST rejected: signature mismatch")
-        return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
-                      "you provided. Check your key and signing method.", 403)
+    if AUTH:
+        # Use the signer's tenant only for credential and IAM resolution. The
+        # bucket-owner scope chosen by _apply_bucket_scope must survive the upload.
+        try:
+            account = find_iam_access_key_account(access_key) or access_key
+        except AmbiguousAccessKeyError:
+            return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+        with request_scope(get_account_id(), region):
+            set_request_account_id(account)
+            credential = resolve_credential(access_key, get_account_id(), fields.get("x-amz-security-token", ""))
+        if isinstance(credential, CredentialResolutionError):
+            if credential.code == "ExpiredTokenException":
+                return _error("ExpiredToken", "The provided token has expired.", 400)
+            if credential.code == "InvalidToken":
+                return _error("InvalidToken", credential.message, 400)
+            return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+        if sigv4:
+            computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
+            signature = fields["x-amz-signature"]
+            signed = re.fullmatch(r"[0-9a-f]{64}", signature) and signatures_match(computed, signature)
+        else:
+            digest = hmac.new(credential.secret_access_key.encode(), encoded.encode(), hashlib.sha1).digest()
+            signature = fields["signature"]
+            signed = signature.isascii() and signatures_match(base64.b64encode(digest).decode(), signature)
+        if not signed:
+            logger.debug("S3 POST rejected: signature mismatch")
+            return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                          "you provided. Check your key and signing method.", 403)
 
     try:
         policy = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
@@ -4510,15 +4509,15 @@ def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, siz
     except (ValueError, TypeError, RecursionError):
         return invalid()
     if _dt.datetime.now(_dt.timezone.utc) >= expires:
-        return denied("policy expired")
+        return denied("Policy expired.")
 
     values = dict(fields, bucket=bucket_name)
     if "bucket" in fields and fields["bucket"] != bucket_name:
-        return denied()
+        return condition_failed("eq", "$bucket", bucket_name)
     covered = set()
     for condition in conditions:
         if isinstance(condition, dict) and condition:
-            matches = [("eq", name, value) for name, value in condition.items()]
+            matches = [("eq", f"${name}", value) for name, value in condition.items()]
         elif isinstance(condition, list) and len(condition) == 3:
             operator, name, value = condition
             if operator == "content-length-range":
@@ -4526,7 +4525,7 @@ def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, siz
                 try:
                     name, value = int(name), int(value)
                 except (TypeError, ValueError):
-                    return denied()
+                    return condition_failed(operator, name, value)
                 if name < 0 or value < name:
                     return invalid()
                 if size < name:
@@ -4536,27 +4535,26 @@ def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, siz
                 continue
             if operator not in ("eq", "starts-with") or not isinstance(name, str) or not name.startswith("$"):
                 return invalid()
-            matches = [(operator, name[1:], value)]
+            matches = [(operator, name, value)]
         else:
             return invalid()
-        for operator, name, value in matches:
-            if not isinstance(name, str) or not name or not isinstance(value, str):
+        for operator, field, value in matches:
+            if not isinstance(field, str) or len(field) < 2 or not isinstance(value, str):
                 return invalid()
-            name = name.lower()
+            name = field[1:].lower()
             if name not in values:
-                return denied()
+                return condition_failed(operator, field, value)
             actual = values[name]
             candidates = actual.split(",") if name == "content-type" and operator == "starts-with" else [actual]
             if not all(candidate == value if operator == "eq" else candidate.startswith(value) for candidate in candidates):
-                return denied()
+                return condition_failed(operator, field, value)
             covered.add(name)
     exempt = {"policy", "x-amz-signature", "awsaccesskeyid", "signature", "file"}
-    if any(name not in covered and name not in exempt and not name.startswith("x-ignore-") for name in values):
-        return denied()
+    extra = [name for name in values if name not in covered and name not in exempt and not name.startswith("x-ignore-")]
+    if extra:
+        return denied(f"Extra input fields: {', '.join(extra)}")
 
-    # Multipart credentials are absent from the router's Authorization header.
-    # Enforce the actual signer against the expanded object key under AUTH.
-    from ministack.app import AUTH
+    # The form's signer, not the request's Authorization header, needs the write permissions.
     if AUTH:
         from ministack.core.iam_evaluator import enforce
 
@@ -4576,7 +4574,7 @@ def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, siz
             for action in sorted(actions):
                 if enforce(access_key, action, "s3", signed_region,
                            resource_arn=f"arn:aws:s3:::{bucket_name}/{fields['key']}", service_context=context) is not None:
-                    return denied("signer lacks object write permission")
+                    return _error("AccessDenied", "Access Denied", 403)
     return None
 
 

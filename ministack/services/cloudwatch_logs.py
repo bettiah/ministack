@@ -586,12 +586,7 @@ def _event_timestamp(event):
 
 
 def _append_log_events(stream, events):
-    """Keep chronological history and stable ties for every log producer.
-
-    Chronological batches extend the existing array without copying history.
-    A late batch replaces it with a stable merge, leaving captured readers'
-    arrays intact. Readers capture their array and end bound under the lock.
-    """
+    """Append events keeping the stream chronological; a late batch replaces the list with a stable merge."""
     if not events:
         return
     ordered = sorted(events, key=_event_timestamp)
@@ -1222,14 +1217,7 @@ def _resolve_log_group_name(data):
 
 
 def _event_cursor(history, size, position, forward):
-    """Name a GetLogEvents boundary by the returned event beside it.
-
-    The cursor is "<timestamp>:<k>", the k-th position within that timestamp's
-    run. Late events stay on their own side of the anchor, and equal-time
-    arrivals sort after their ties, so the boundary never shifts. A backward
-    boundary at the tail anchors on the last event, so later events stay
-    after it. "-" marks the head of the stream, or a boundary in an empty one.
-    """
+    """GetLogEvents boundary as "<timestamp>:<k>" (k-th event of that timestamp), or "-" at the head."""
     anchor = position - 1 if forward or position == size else position
     if not 0 <= anchor < size:
         return "-"
@@ -1272,7 +1260,7 @@ def _get_log_events(data):
         history = _log_groups[group]["streams"][stream]["events"]
         size = len(history)
     lower = bisect_left(history, start_time, hi=size, key=_event_timestamp) if start_time is not None else 0
-    upper = bisect_right(history, end_time, lo=lower, hi=size, key=_event_timestamp) if end_time is not None else size
+    upper = bisect_left(history, end_time, lo=lower, hi=size, key=_event_timestamp) if end_time is not None else size
 
     forward = start_from_head
     position = lower if forward else upper
@@ -1363,7 +1351,6 @@ def _filter_log_events(data):
         )
 
     events = []
-    searched = []
     ranges = []
     streams = _log_groups[group]["streams"]
     target_streams = stream_names if stream_names else list(streams.keys())
@@ -1373,7 +1360,6 @@ def _filter_log_events(data):
             stream = streams.get(sn)
             if stream is None:
                 continue
-            searched.append({"logStreamName": sn, "searchedCompletely": True})
             history = stream["events"]
             start = bisect_left(history, start_time, key=_event_timestamp) if start_time is not None else 0
             end = bisect_right(history, end_time, key=_event_timestamp) if end_time is not None else len(history)
@@ -1381,7 +1367,7 @@ def _filter_log_events(data):
 
     # merge is stable across input streams and only pulls the next candidate.
     scanned = 0
-    for event, sn in heapq.merge(*ranges, key=lambda entry: entry[0]["timestamp"]):
+    for event, sn in heapq.merge(*ranges, key=lambda entry: (entry[0]["timestamp"], entry[0].get("ingestionTime", 0))):
         if len(events) >= limit:
             break
         scanned += 1
@@ -1391,7 +1377,7 @@ def _filter_log_events(data):
                 break
     logger.debug("FilterLogEvents streams=%d scanned=%d returned=%d limit=%s",
                  len(ranges), scanned, len(events), limit)
-    return json_response({"events": events, "searchedLogStreams": searched})
+    return json_response({"events": events, "searchedLogStreams": []})
 
 
 # ---------------------------------------------------------------------------

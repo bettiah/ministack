@@ -945,8 +945,7 @@ def _act_set_queue_attributes(data: dict, qurl: str) -> dict:
     _validate_numeric_attrs(incoming)
     for k, v in incoming.items():
         if k in {"Policy", "RedrivePolicy", "RedriveAllowPolicy"} and v == "":
-            # Terraform deletes standalone policy resources with an empty
-            # attribute value. Reads must then omit the removed attribute.
+            # An empty value removes the policy (Terraform's policy-resource delete).
             q["attributes"].pop(k, None)
             logger.debug("Removed queue attribute %s from %s", k, url)
         else:

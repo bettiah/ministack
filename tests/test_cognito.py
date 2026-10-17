@@ -4878,8 +4878,7 @@ def test_oauth2_token_client_credentials_rejects_invalid_scopes(requested, error
         status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', form, headers=headers)
         response = json.loads(body)
         assert status == 400, body
-        assert response['error'] == error
-        assert 'access_token' not in response
+        assert response == {'error': error}
     finally:
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
 

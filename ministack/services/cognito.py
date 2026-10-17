@@ -792,8 +792,7 @@ def _granted_scopes(client: dict | None, requested: str | None, grant: str = "au
     """The scopes a token-endpoint grant carries: the requested ones the client allows, or all it allows."""
     listed = (client or {}).get("AllowedOAuthScopes") or []
     if not listed and not requested:
-        # Only user sign-ins inherit the user-pool API scope. M2M grants
-        # cannot gain that scope when the client has no custom scopes.
+        # Only user sign-ins inherit the user-pool API scope.
         return "" if grant == "client_credentials" else None
     # client_credentials grants only resource-server scopes
     allowed = sorted(s for s in listed if "/" in s or grant != "client_credentials")
@@ -809,27 +808,21 @@ def _id_token_granted(scope: str | None) -> bool:
 
 
 def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
-    """Reject the whole M2M grant when a custom scope is undefined or not allowed.
-
-    AWS's token endpoint documents invalid_scope for an unknown resource server
-    or scope, and invalid_grant for a defined scope the app client does not allow.
-    """
+    """invalid_scope for an undefined scope, invalid_grant for one the client doesn't allow; the whole grant fails."""
     allowed = client.get("AllowedOAuthScopes") or []
-    # RFC 6749 treats an empty value as omitted, but a nonempty value must
-    # contain a scope token. Whitespace alone must not pass a vacuous check.
-    if requested and not requested.split():
-        return _oauth2_error("invalid_scope", "The requested scope is malformed.")
     wanted = requested.split() if requested else [s for s in allowed if "/" in s]
     defined = {
         f"{identifier}/{scope['ScopeName']}"
         for identifier, server in (pool.get("_resource_servers") or {}).items()
         for scope in server.get("Scopes", [])
     }
-    if any(scope not in defined for scope in wanted):
-        return _oauth2_error("invalid_scope", "The requested scope does not exist.")
-    if any(scope not in allowed for scope in wanted):
-        return _oauth2_error("invalid_grant", "The requested scope is not allowed for this client.")
-    return None
+    if (requested and not wanted) or any(scope not in defined for scope in wanted):
+        error = "invalid_scope"
+    elif any(scope not in allowed for scope in wanted):
+        error = "invalid_grant"
+    else:
+        return None
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": error}).encode()
 
 
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",

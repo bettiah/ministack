@@ -2769,9 +2769,7 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
     return 204, {}, b""
 
 
-# Code and configuration share a revision; each alias has its own. Only
-# registry lookup is global. Weak entries disappear once all active callers
-# release their strong references, without persisting locks in function state.
+# One lock per function (code and configuration share a revision) or alias.
 _revision_locks = weakref.WeakValueDictionary()
 _revision_locks_guard = threading.Lock()
 
@@ -2788,9 +2786,6 @@ def _serialized_revision_update(*, alias=False):
                 if lock is None:
                     lock = threading.RLock()
                     _revision_locks[key] = lock
-            # Keep this reference while waiting as well as while executing:
-            # a waiter must never acquire a replacement lock for the same key.
-            # Reentrant acquisition cannot deadlock a same-thread nested call.
             with lock:
                 return operation(*args, **kwargs)
         return guarded
@@ -2802,7 +2797,8 @@ def _check_revision(current: dict, data: dict):
         logger.debug("Rejected Lambda update with a stale RevisionId")
         return error_response_json(
             "PreconditionFailedException",
-            "The RevisionId provided does not match the latest RevisionId.",
+            "The RevisionId provided does not match the latest RevisionId for the Lambda function or alias. "
+            "Call the GetFunction or the GetAlias API to retrieve the latest RevisionId for your resource.",
             412,
         )
     return None
